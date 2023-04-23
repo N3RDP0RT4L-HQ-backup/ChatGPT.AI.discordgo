@@ -1,0 +1,125 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/bwmarrin/discordgo"
+)
+
+var (
+	discord  *discordgo.Session
+	endpoint = "http://127.0.0.1:8080/api" // your API endpoint goes here
+)
+
+func main() {
+	configFile, err := os.Open("config.json")
+	if err != nil {
+		log.Fatalf("Failed to open config file: %v", err)
+	}
+	defer configFile.Close()
+
+	var config struct {
+		DiscordBotToken string `json:"token"`
+	}
+
+	err = json.NewDecoder(configFile).Decode(&config)
+	if err != nil {
+		log.Fatalf("Failed to decode config file: %v", err)
+	}
+
+	discordToken := config.DiscordBotToken
+	if discordToken == "" {
+		log.Fatalf("No discord bot token was provided in config file")
+	}
+
+	var errDiscord error
+	discord, errDiscord = discordgo.New("Bot " + discordToken)
+	if errDiscord != nil {
+		log.Fatalf("Failed to create a new Discord session: %v", errDiscord)
+	}
+
+	discord.AddHandler(handleMessage)
+
+	errDiscord = discord.Open()
+	if errDiscord != nil {
+		log.Fatalf("Failed to open a Discord connection: %v", errDiscord)
+	}
+	defer discord.Close()
+
+	log.Println("Discord bot is running. Press CTRL-C to exit.")
+	select {}
+}
+
+func handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
+	if m.Author.Bot {
+		return
+	}
+
+	if strings.HasPrefix(m.Content, fmt.Sprintf("<@%s>", s.State.User.ID)) {
+		question := strings.TrimSpace(strings.TrimPrefix(m.Content, fmt.Sprintf("<@%s>", s.State.User.ID)))
+		if question == "" {
+			return
+		}
+
+		go func() {
+			var typingDuration time.Duration = 2 // set the typing indicator duration in seconds
+
+			// show the typing indicator
+			s.ChannelTyping(m.ChannelID)
+			time.Sleep(typingDuration * time.Second)
+
+			response, errAPI := askAPI(question)
+			if errAPI != nil {
+				log.Printf("Failed to get a response from the API: %v", errAPI)
+				return
+			}
+
+			// send the response message with the answer and stop the typing indicator
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("%s, %s", m.Author.Mention(), response))
+		}()
+	}
+}
+
+func askAPI(question string) (string, error) {
+	client := &http.Client{}
+
+	reqBody := map[string]string{"prompt": question} // modify the request body to include a prompt field
+	reqBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request body: %v", err)
+	}
+
+	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(reqBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create a new HTTP request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send HTTP request to the API: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("the API returned an error status code: %v", resp.Status)
+	}
+
+	var responseBuilder strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		responseBuilder.WriteString(scanner.Text())
+		responseBuilder.WriteString("\n")
+	}
+
+	return responseBuilder.String(), nil
+}
